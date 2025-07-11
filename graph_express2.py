@@ -9,6 +9,9 @@ from operator_defs import default_funcs, operator_signatures
 from ilpscheduler import ILPScheduler
 import matplotlib.pyplot as plt
 
+
+from matplotlib.animation import FuncAnimation
+import colorsys
 # Default concurrency for SIMD operations
 SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
 
@@ -191,6 +194,10 @@ class ProcessGraph:
                 type=node_type,
                 expr_obj=node,
                 extra_args=extra_args,
+                domain_node=DomainNode(
+                    shape=(1,1,1), #default will be function pointer
+                    unit_size=1,  # default unit size for function pointers
+                ),
                 store_id=store_id,
                 parents=[],
                 children=[])
@@ -308,6 +315,12 @@ class ProcessGraph:
                     store_node_id,
                     label=store_label,
                     type="Store",
+                    domain_node=DomainNode(
+                        id=store_node_id,
+                        shape=(1, 1, 1),  # default shape for store nodes
+                        unit_size=1,  # default unit size for store nodes
+                    ),#when you get back fix datasetexclusivity in data graph
+
                     store_id=store_id,
                     expr_obj=store_label,
                     parents=[(nid, 'value')],
@@ -325,6 +338,77 @@ class ProcessGraph:
                 self.G.add_edge(nid, store_node_id, extra=[edge])
 
                 current_outputs += 1
+    def group_edges_by_dataset(self, dataG):
+        """
+        Returns a nested dict grouping each edge by the (role, level, type) tuples found in its 'extras'.
+        Structure: { role: { level: { typ: [ (src, tgt), ... ] } } }
+        """
+        grouped = {}
+        for src, tgt, attrs in dataG.edges(data=True):
+            for ds in attrs.get('extras', []):
+                role, level, typ = ds
+                # initialize nested dicts if needed
+                if level not in grouped:
+                    grouped[level] = {}
+                if typ not in grouped[level]:
+                    grouped[level][typ] = {}
+                if role not in grouped[level][typ]:
+                    grouped[level][typ][role] = []
+                # append the edge tuple
+                grouped[level][typ][role].append((src, tgt))
+        return grouped
+
+    def check_set_involvement(self, node, nodeset):
+        """
+        Check if a node is involved in a nodeset.
+        Returns True if the node is part of the nodeset, False otherwise.
+        """
+        for (role, lvl, typ), candidate_node in nodeset:
+            if candidate_node == node:
+                return (role, lvl, typ)  # return the role, level, type if involved
+        return None  # not involved in this nodeset
+
+    def create_data_flow_dag(self, nodesets, uG):
+        dataG = nx.DiGraph()
+        datasets = {}   # will map dataset_id -> set of DomainNode.id
+        for dataset_id, ns in nodesets.items():         # unpack the dict item
+            datasets[dataset_id] = set()
+            # for each process node in this nodeset
+            for member in ns.member_nodes:              # Node objects
+                proc_nid = member.id                     # matches uG’s node IDs
+                if proc_nid not in uG:
+                    continue
+                dom_node = uG.nodes[proc_nid]['domain_node']
+                datasets[dataset_id].add(dom_node.id)
+
+                # add the domain node as a vertex in the new DAG
+                dataG.add_node(
+                    dom_node.id,
+                    label=uG.nodes[proc_nid]['label'],
+                    type=uG.nodes[proc_nid]['type'],
+                    original_node=proc_nid,
+                    domain_node=dom_node,
+                    dataset_id=dataset_id,
+                )
+
+            import itertools
+
+            # … after you’ve added all nodes …
+
+            # now add every uG edge (in or out) for each member
+            for member in ns.member_nodes:
+                n = member.id
+                for src, tgt in itertools.chain(uG.in_edges(n), uG.out_edges(n)):
+                    dom_src = uG.nodes[src]['domain_node'].id
+                    dom_tgt = uG.nodes[tgt]['domain_node'].id
+
+                    if dataG.has_edge(dom_src, dom_tgt):
+                        dataG.edges[dom_src, dom_tgt].setdefault('extras', []).append(dataset_id)
+                    else:
+                        dataG.add_edge(dom_src, dom_tgt, extras=[dataset_id])
+
+        return dataG
+
 
     def compute_levels(self, method='asap', order='processing', interference_mode='asap-maxslack'):
         """
@@ -339,7 +423,7 @@ class ProcessGraph:
         self.produce_proc_and_mem_bins(self.proc_lifespans)
         self.universal_graph_interference_bins = self.merge_proc_and_mem_graphs(self.G, self.mG, self.process_bins, self.memory_bins, self.proc_interference_graph)
         self.nodesets = self.condense_to_nodesets()
-
+        self.dataG = self.create_data_flow_dag(self.nodesets, self.uG)
         #print exauhstive summary of items produced
         print(f"Levels computed: {len(self.levels)} nodes")
         print(f"Process interference graph: {len(self.proc_interference_graph.nodes)} nodes, {len(self.proc_interference_graph.edges)} edges")
@@ -591,8 +675,8 @@ class ProcessGraph:
                         for extra_item in data.get('extra', []):
                             # our memory node ids come from the Edge subedge that defined them
                             if id(extra_item) == node and (src in stage2 or dst in stage2):
-                                self.uG.add_edge(src, node)
-                                self.uG.add_edge(node, dst)
+                                self.uG.add_edge(src, node, label=f"{self.G.nodes[src]['label']} -> {self.mG.nodes[node]['label']}")
+                                self.uG.add_edge(node, dst, label=f"{self.mG.nodes[node]['label']} -> {self.G.nodes[dst]['label']}")
                                 if not universal_graph_interference_bins[idx]:
                                     universal_graph_interference_bins[idx] = []
                                 #for all permutations of src, node, and dst, add edges
@@ -755,7 +839,13 @@ class ProcessGraph:
                                         id=id(edge),
                                         shape=shape
                                     )
-                                    self.mG.add_node(domain_node.id, **domain_node.__dict__)
+                                    self.mG.add_node(
+                                        domain_node.id,
+                                        label=f"Memory for: {source_node['label']} -> {target_node['label']}",
+                                        domain_node=domain_node,
+                                        type='Memory',
+                                        store_id=source_node.get('store_id', None),
+                                    )
                                     memory_bins[idx].append(domain_node.id)
                                     # we don't extend the domain node over an additional idx
                                     # because it's tracking the process nodes that already
@@ -886,6 +976,7 @@ class ProcessGraph:
             
 
         def create_nodesets(node_group, role):
+
             for lvl, type_dict in node_group.items():
                 for typ, nid_dict in type_dict.items():
                     ids = list(nid_dict)
@@ -894,7 +985,7 @@ class ProcessGraph:
                     ns = NodeSet(*shape)
                     ns.member_nodes = [Node(id=nid,
                                             location_in_set=ns.nd_from_flat(i),
-                                            location_in_memory=None,
+                                            location_in_memory=self.uG.nodes[nid].get('domain_node', None),
                                             readwrite=READWRITE)
                                        for i, nid in enumerate(ids)]
                     nodesets[(role, lvl, typ)] = ns
@@ -972,19 +1063,19 @@ class ProcessGraph:
         self.print_colorized_operations()
 
 
-    def plot_simple_graph(self, layout='spring'):
+    def plot_simple_graph(self, graph, layout='spring'):
         """
         Plots a simple flowchart-like view of the graph without edge labels.
         """
         plt.figure(figsize=(12, 8))
         if layout == 'spring':
-            pos = nx.spring_layout(self.G, seed=42)
+            pos = nx.spring_layout(graph, seed=42)
         elif layout == 'shell':
-            pos = nx.shell_layout(self.G)
+            pos = nx.shell_layout(graph)
         else:
-            pos = nx.spring_layout(self.G, seed=42)
-        labels = nx.get_node_attributes(self.G, 'label')
-        nx.draw(self.G, pos, with_labels=True, labels=labels, node_size=800,
+            pos = nx.spring_layout(graph, seed=42)
+        labels = nx.get_node_attributes(graph, 'label')
+        nx.draw(graph, pos, with_labels=True, labels=labels, node_size=800,
                 node_color='lightblue', edge_color='gray', font_size=10)
         plt.show()
 
@@ -1016,6 +1107,85 @@ class ProcessGraph:
         
         nx.draw_networkx_edge_labels(self.G, pos, edge_labels=edge_labels, font_size=8)
         plt.show()
+
+
+    def get_rgb_color(level, num_levels):
+        """Convert a level to an RGB tuple."""
+        hue = (level % num_levels) / num_levels
+        r, g, b = colorsys.hsv_to_rgb(hue, 1, 1)
+        return (r, g, b)
+
+    def animate_data_flow(self, dataG, duration=5, fps=30):
+        """
+        Animate the data flow graph by cycling through datasets present in edge 'extras'.
+        Colors nodes and edges belonging to the current dataset.
+        """
+        # 1) layout
+        pos = nx.shell_layout(dataG)
+
+        # 2) get nested grouping: { level → { type → { role → [ (src, tgt), … ] } } }
+        grouped = self.group_edges_by_dataset(dataG)
+
+        # 3) flatten that grouping into an ordered sequence (level→type→role)
+        ordered_keys = []
+        for lvl in sorted(grouped):
+            for typ in sorted(grouped[lvl]):
+                for role in sorted(grouped[lvl][typ]):
+                    ordered_keys.append((role, lvl, typ))
+        total = len(ordered_keys)
+
+        # 4) draw static background
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_title("Data Flow Animation")
+        ax.axis('off')
+        nx.draw_networkx_edges(dataG, pos, ax=ax, edge_color='lightgray')
+        node_collection = nx.draw_networkx_nodes(dataG, pos, ax=ax, node_color='lightgray')
+        nx.draw_networkx_labels(dataG, pos, ax=ax, font_size=8)
+
+        # 5) keep handles to each edge line + its extras
+        edge_lines = {}
+        for (u, v, attrs) in dataG.edges(data=True):
+            line = ax.plot(
+                [pos[u][0], pos[v][0]],
+                [pos[u][1], pos[v][1]],
+                color='lightgray',
+                linewidth=2
+            )[0]
+            edge_lines[(u, v)] = (line, attrs.get('extras', []))
+
+        # 6) animation update uses only ordered_keys
+        def update(frame):
+            current = ordered_keys[frame % total]
+            ax.set_title(f"Dataset: {current}")
+
+            # highlight edges in this dataset
+            for (u, v), (line, extras) in edge_lines.items():
+                if current in extras:
+                    line.set_color('red')
+                    line.set_linewidth(3)
+                else:
+                    line.set_color('lightgray')
+                    line.set_linewidth(1)
+
+            # highlight connected nodes
+            highlights = {
+                u for (u, v), (_, extras) in edge_lines.items() if current in extras
+            } | {
+                v for (u, v), (_, extras) in edge_lines.items() if current in extras
+            }
+            node_colors = [
+                'blue' if n in highlights else 'lightgray'
+                for n in dataG.nodes()
+            ]
+            node_collection.set_color(node_colors)
+            return list(edge_lines.keys()) + [node_collection]
+
+        frames = total * fps
+        anim = FuncAnimation(fig, update, frames=frames, interval=1000/fps, blit=False, repeat=True)
+        plt.show()
+
+# Example usage:
+# animate_data_flow(pg.dataG)
 
 # ----------------------------
 # Demo execution (compartmentalized to main)
@@ -1060,6 +1230,7 @@ def main():
         except Exception as e:
             print(f"❌ Test failed: {e}")
             
+        return result
     from dec import DEC
     from orbital import Orbit
 
@@ -1168,10 +1339,12 @@ def main():
         #pg.print_parallel_bands()
 
         # run the original data correctness
-        pg.compute_levels(method='asap')  # use ASAP for correct run to match tests
-        pg.print_lifespans_ascii()
+        pg.compute_levels(method='alap')  # use ASAP for correct run to match tests
+        #pg.print_lifespans_ascii()
         data_sources = test['data_sources']()
-        run(pg, data_sources, test['expected_fn'])
+        pg.animate_data_flow(pg.dataG, duration=5, fps=2)
+        #pg.plot_simple_graph(pg.dataG, layout='shell')
+        #print(run(pg, data_sources, test['expected_fn']))
 
 
 if __name__ == "__main__":
