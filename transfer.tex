@@ -1,0 +1,60 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{physics}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Symbolic Orbital Transfer System}
+\author{Albert et al.}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section*{Overview}
+This document describes the canonical symbolic system for orbital transfers constructed by Albert, generalizing classical two-body mechanics to an arbitrary multi-attractor environment, with spline-based thrust formulation over arc length.
+
+It provides a complete symbolic family of constraints suitable for subsequent numerical optimization, machine learning control, or analytical exploration.
+
+\section*{Equations of Motion}
+Let $r(s)$ denote the position vector parameterized by arc length $s$, and $F_\text{extra}(s)$ the applied spline force. 
+
+With multiple gravitational centers $\{(c_i, \mu_i)\}$ where $c_i$ is the center position and $\mu_i$ is the gravitational parameter, the force contributions are
+\[
+F_{\text{grav},i} = -\mu_i \frac{r - c_i}{\norm{r - c_i}^3}
+\]
+
+Then the symbolic arc-length equation of motion is
+\[
+\frac{d^2 r}{ds^2} = \sum_i F_{\text{grav},i} + F_\text{extra}(s)
+\]
+
+\section*{Total Mechanical Energy}
+The symbolic total energy along the trajectory is given by
+\[
+E_{\text{total}}(s) = \frac12 \left\|\frac{dr}{ds}\right\|^2 - \sum_i \frac{\mu_i}{\norm{r - c_i}}
+\]
+
+\section*{Integral Force Cost}
+The total symbolic cost over the distance traveled is represented by
+\[
+\int_0^L \norm{F_\text{extra}(s)} \, ds
+\]
+where $L$ is the total arc length of the trajectory.
+
+\section*{Boundary Conditions}
+We enforce the symbolic initial and terminal constraints
+\[
+r(0) = r_{\text{start}}, \quad r(L) = r_{\text{end}}
+\]
+
+\section*{Remarks}
+\begin{itemize}
+    \item All quantities are purely symbolic, defined via the \texttt{sympy} library.
+    \item The system does not solve for a trajectory explicitly; it produces the symbolic family of solutions subject to these constraints.
+    \item This allows deferred optimization, variational calculus, or machine learning exploration on the exact same symbolic landscape.
+\end{itemize}
+
+\end{document}

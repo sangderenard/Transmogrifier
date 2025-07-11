@@ -1060,6 +1060,9 @@ def main():
         except Exception as e:
             print(f"❌ Test failed: {e}")
             
+    from dec import DEC
+    from orbital import Orbit
+
 
 
         
@@ -1122,9 +1125,26 @@ def main():
                 'C': np.random.rand(M_val, N_val)
             },
             'expected_fn': lambda ds: (ds['A'] + ds['C']) ** 2
+        },
+        {
+            'name': "DEC Laplace-de Rham of scalar field",
+            'expr_fn': lambda: DEC.laplace_de_rham(sympy.Function('φ'), sympy.Function('vol_dual_cell'), sympy.Function('vol_dual_edge')),
+            'dims': (),
+            'data_sources': lambda: {},
+            'expected_fn': lambda ds: None  # purely symbolic, just check graph builds
+        },
+        {
+            'name': "Orbital symbolic transfer EOM",
+            'expr_fn': lambda: Orbit.stable_orbit_transfer_solution(
+                Orbit.symbolic_orbit('1'),
+                Orbit.symbolic_orbit('2')
+            )['equation_of_motion'],
+            'dims': (),
+            'data_sources': lambda: {},
+            'expected_fn': lambda ds: None
         }
-    ]
 
+    ]
     # ----------------------------
     # Execute all tests
     # ----------------------------
