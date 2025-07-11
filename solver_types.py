@@ -161,12 +161,42 @@ class DomainNode:
         """
         return np.ndindex(*self.shape) if self.shape else iter([()])
 
-    def __str__(self):
-        return (f"DomainNode(shape={self.shape}, unit_size={self.unit_size}, "
-                f"total_elements={self.total_elements}, total_allocation={self.total_allocation})")
+    def __init__(self, shape, unit_size=1):
+        self.shape = shape
+        self.unit_size = unit_size
+        self.id = self._generate_id()
+        self.memory = {}  # Initialize memory as a dictionary for dynamic storage
+        # compute total elements and allocation
+        object.__setattr__(self, 'total_elements', self._compute_total_elements())
+        object.__setattr__(self, 'total_allocation', self.total_elements * self.unit_size)
+
+    def put(self, node_id, value):
+        """
+        Store a value in memory for the given node ID.
+        :param node_id: ID of the node to store the value for.
+        :param value: Value to store.
+        """
+        self.memory[node_id] = value
+
+    def get(self, node_id):
+        """
+        Retrieve a value from memory for the given node ID.
+        :param node_id: ID of the node to retrieve the value for.
+        :return: Value stored for the node ID, or None if not found.
+        """
+        return self.memory.get(node_id)
+    
+    def get_all(self):
+        """
+        Retrieve all values stored in memory.
+        :return: Dictionary of all node IDs and their corresponding values.
+        """
+        return self.memory.copy()
 
     def __repr__(self):
-        return self.__str__()
+        return (f"DomainNode(shape={self.shape}, unit_size={self.unit_size}, "
+                f"total_elements={self.total_elements}, total_allocation={self.total_allocation}, "
+                f"memory={self.memory})")
 
     def flatten_index(self, idx):
         """
