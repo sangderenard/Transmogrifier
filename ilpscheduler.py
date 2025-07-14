@@ -126,7 +126,7 @@ class ILPScheduler:
 
         # Build lifespan ranges
         lifespans = {nid: (asap[nid] - 1, max_slack[nid]) for nid in asap} # writes happen previous round, reads happen current round
-
+        
         # Build minimal interference graph (pure node lifespans overlap)
         interference_graph = nx.Graph()
         interference_graph.add_nodes_from(asap.keys())

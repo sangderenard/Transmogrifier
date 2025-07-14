@@ -124,7 +124,7 @@ from functools import reduce
 from operator import mul
 import numpy as np
 
-@dataclass(frozen=True)
+@dataclass#(frozen=True)
 class DomainNode:
     """
     Represents a multi-dimensional allocation of unit nodes in the computational memory graph.
@@ -144,6 +144,10 @@ class DomainNode:
 
     def __post_init__(self):
         # compute total elements and allocation
+        self.memory = {}  # Initialize memory as a dictionary for dynamic storage
+        if not self.shape:
+            self.shape = (1,)  # Default to a single unit if no shape is provided
+        object.__setattr__(self, 'shape', tuple(self.shape))  # Ensure shape is immutable
         object.__setattr__(self, 'total_elements', self._compute_total_elements())
         object.__setattr__(self, 'total_allocation', self.total_elements * self.unit_size)
 
@@ -160,15 +164,6 @@ class DomainNode:
         Example: for shape (2,3), yields (0,0),(0,1),(0,2),(1,0),...
         """
         return np.ndindex(*self.shape) if self.shape else iter([()])
-
-    def __init__(self, shape, unit_size=1):
-        self.shape = shape
-        self.unit_size = unit_size
-        self.id = self._generate_id()
-        self.memory = {}  # Initialize memory as a dictionary for dynamic storage
-        # compute total elements and allocation
-        object.__setattr__(self, 'total_elements', self._compute_total_elements())
-        object.__setattr__(self, 'total_allocation', self.total_elements * self.unit_size)
 
     def put(self, node_id, value):
         """

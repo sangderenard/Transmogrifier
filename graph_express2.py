@@ -1,250 +1,69 @@
 from turtle import width
 import sympy
 import numpy as np
+from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 import networkx as nx
 from colorama import Fore, Style, init
 from solver_types import Operation, NodeSet, Node, READWRITE, DomainNode, Edge
-from operator_defs import default_funcs, operator_signatures
+from operator_defs import default_funcs, operator_signatures, role_schemas
 from ilpscheduler import ILPScheduler
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import colorsys
+import random
+from collections import deque
+import random
+from collections import deque
+from graph_express2_tests import test_suite
+from graph_express2printing import GraphExpresss2Printer
+
+class _RandomFloatQueue(deque):
+    """
+    Drop-in stand-in for any queue class used elsewhere in ProcessGraph.
+    • .get()   → random float   (so a consumer can keep pulling values)
+    • .put(_)  → absorbed       (writer calls succeed but are ignored)
+    • __call__ → random float   (if the code treats the consumer as a func)
+    """
+    __slots__ = ()                      # no per-instance dict → cheap
+    def get(self):
+        return random.random()
+    def put(self, _):
+        # silently accept anything; we’re a sink
+        pass
+    __call__ = get                      # allow direct call pattern
+
+# initialise one global instance once; re-use it everywhere
+_DUMMY_QUEUE = _RandomFloatQueue()
 SIMD_DEFAULT_CONCURRENCY = 4  # default concurrency for SIMD operations
+import numpy as np
+import random
+from collections.abc import Callable
+
+
+def _resolve(val):
+    """
+    Make sure anything coming out of a domain-queue is *numeric*:
+
+    • _RandomFloatQueue → draw a float
+    • other callables   → call them once
+    • list/tuple        → promote to NumPy array (avoids list*float errors)
+    • everything else   → leave unchanged
+    """
+    if isinstance(val, _RandomFloatQueue):
+        return val()                    # our queue is callable → random float
+    if isinstance(val, Callable):
+        try:
+            return val()                # user-supplied lambda, etc.
+        except TypeError:
+            pass                        # not a no-arg callable – ignore
+    if isinstance(val, (list, tuple)):
+        return np.asarray(val, dtype=float)
+    return val
 
 import sympy
 import numpy as np
 from sympy import Sum, IndexedBase, Idx, symbols, Function
-
-from physics import (
-    vis_viva_eq,
-    sch_eq,
-    efe,
-    laplace_de_rham,
-    fourier_transform,
-    A, B,
-    maxwell_eq,
-    field_tensor,
-    Tμν_em,
-    wave_eq,
-    dirac_eq,
-)
-from dec import DEC
-from orbital import Orbit
-# Assume mesh_dual_edge and mesh_voronoi_cell are defined in physics.py as well
-
-M_val, N_val, K_val = 3, 6, 9
-M, N, K = symbols('M N K', integer=True)
-i, j, k = Idx('i', M), Idx('j', N), Idx('k', K)
-A_t, B_t, C_t = IndexedBase('A'), IndexedBase('B'), IndexedBase('C')
-x, y, z = symbols('x y z', real=True)
-
-test_suite = [
-    {
-        'name': "1 + 1",
-        'expr_fn': lambda: sympy.Integer(1) + sympy.Integer(1),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: 2
-    },
-    {
-        'name': "(x + y) * z (irreducible)",
-        'expr_fn': lambda: (sympy.Symbol('x') + sympy.Symbol('y')) * sympy.Symbol('z'),
-        'dims': (1,),
-        'data_sources': lambda: {'x': 2, 'y': 3, 'z': 4},
-        'expected_fn': lambda ds: (ds['x'] + ds['y']) * ds['z']
-    },
-    {
-        'name': "Elementwise A + C",
-        'expr_fn': lambda ii, jj: A_t[ii, jj] + C_t[ii, jj],
-        'dims': (M_val, N_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, N_val),
-            'C': np.random.rand(M_val, N_val)
-        },
-        'expected_fn': lambda ds: ds['A'] + ds['C']
-    },
-    {
-        'name': "Dot product across K",
-        'expr_fn': lambda ii, jj: Sum(A_t[ii, k] * B_t[k, jj], (k, 0, K_val - 1)),
-        'dims': (M_val, N_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, K_val),
-            'B': np.random.rand(K_val, N_val)
-        },
-        'expected_fn': lambda ds: np.dot(ds['A'], ds['B'])
-    },
-    {
-        'name': "Elementwise A * C",
-        'expr_fn': lambda ii, jj: A_t[ii, jj] * C_t[ii, jj],
-        'dims': (M_val, N_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, N_val),
-            'C': np.random.rand(M_val, N_val)
-        },
-        'expected_fn': lambda ds: ds['A'] * ds['C']
-    },
-    {
-        'name': "(A + C) ** 2",
-        'expr_fn': lambda ii, jj: (A_t[ii, jj] + C_t[ii, jj])**2,
-        'dims': (M_val, N_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, N_val),
-            'C': np.random.rand(M_val, N_val)
-        },
-        'expected_fn': lambda ds: (ds['A'] + ds['C']) ** 2
-    },
-    {
-        'name': "3D Tensor Outer Product",
-        'expr_fn': lambda ii, jj, kk: A_t[ii, jj] * B_t[kk, jj] + C_t[ii, kk],
-        'dims': (M_val, N_val, K_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, N_val),
-            'B': np.random.rand(K_val, N_val),
-            'C': np.random.rand(M_val, K_val)
-        },
-        'expected_fn': lambda ds: np.einsum('ij,kj->ikj', ds['A'], ds['B']) + np.broadcast_to(ds['C'][:, None, :], (M_val, N_val, K_val))
-    },
-    {
-        'name': "Elementwise Sin + Exp",
-        'expr_fn': lambda ii, jj: sympy.sin(A_t[ii, jj]) + sympy.exp(C_t[ii, jj]),
-        'dims': (M_val, N_val),
-        'data_sources': lambda: {
-            'A': np.random.rand(M_val, N_val),
-            'C': np.random.rand(M_val, N_val)
-        },
-        'expected_fn': lambda ds: np.sin(ds['A']) + np.exp(ds['C'])
-    },
-    {
-        'name': "DEC Laplace-de Rham (symbolic, generic)",
-        'expr_fn': lambda: DEC.laplace_de_rham(Function('φ'), Function('vol_dual_cell'), Function('vol_dual_edge')),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "DEC Laplace-de Rham (mesh dual functions)",
-        'expr_fn': lambda: DEC.laplace_de_rham(Function('φ'), DEC.mesh_voronoi_cell, DEC.mesh_dual_edge),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "DEC Voronoi Dual Cell Area (vertex 0, tris)",
-        'expr_fn': lambda: DEC.mesh_voronoi_cell(0, [(0,1,2),(0,2,3),(0,3,1)], sympy.IndexedBase('V')),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "DEC Dual Edge Length (0,2,1,3)",
-        'expr_fn': lambda: DEC.mesh_dual_edge(0, 2, 1, 3, sympy.IndexedBase('V')),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "DEC Circumcenter2D (0,1,2)",
-        'expr_fn': lambda: DEC.circumcenter2D(0, 1, 2, sympy.IndexedBase('V')),
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Symbolic Fourier Transform (from physics.py)",
-        'expr_fn': lambda: fourier_transform,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Vis Viva Equation (Orbital Mechanics)",
-        'expr_fn': lambda: vis_viva_eq,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Schrödinger Equation (physics.py)",
-        'expr_fn': lambda: sch_eq,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Einstein Field Equation (symbolic, 4x4)",
-        'expr_fn': lambda: efe,
-        'dims': (4, 4),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "DEC Laplace-de Rham (physics.py symbol)",
-        'expr_fn': lambda: laplace_de_rham,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Magnetic Vector Potential (A)",
-        'expr_fn': lambda: A,
-        'dims': (3,),  # 3-vector
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Magnetic Field (B = curl A)",
-        'expr_fn': lambda: B,
-        'dims': (3,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Maxwell Equation (covariant symbolic)",
-        'expr_fn': lambda: maxwell_eq,
-        'dims': (4, 4),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Field Tensor F^{μν}=∂^μA^ν-∂^νA^μ",
-        'expr_fn': lambda: field_tensor,
-        'dims': (4, 4),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Stress-Energy Tensor T^{μν}",
-        'expr_fn': lambda: Tμν_em,
-        'dims': (4, 4),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Wave Equation (physics.py)",
-        'expr_fn': lambda: wave_eq,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Dirac Equation (physics.py)",
-        'expr_fn': lambda: dirac_eq,
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-    {
-        'name': "Orbital symbolic transfer EOM",
-        'expr_fn': lambda: Orbit.stable_orbit_transfer_solution(
-            Orbit.symbolic_orbit('1'),
-            Orbit.symbolic_orbit('2')
-        )['equation_of_motion'],
-        'dims': (1,),
-        'data_sources': lambda: {},
-        'expected_fn': lambda ds: None
-    },
-]
 
 
 init(autoreset=True)
@@ -259,17 +78,7 @@ def multi_sort(collection, key_funcs):
     items_with_keys = list(zip(collection, compound_keys))
     items_with_keys.sort(key=lambda x: x[1])
     return [item for item, _ in items_with_keys]
-def get_color(level, num_levels, max_hues=MAX_HUES):
-    """Generate ANSI TrueColor escape for a level normalized to num_levels (capped at max_hues)."""
-    # Determine effective hue count
-    hue_count = min(num_levels, max_hues)
-    # Normalize level into [0,1)
-    h = (level % hue_count) / hue_count
-    r, g, b = colorsys.hsv_to_rgb(h, 1, 1)
-    return f"\033[38;2;{int(r*255)};{int(g*255)};{int(b*255)}m"
 
-# fallback static list (unused)
-colors = []
 import torch
 
 class ExpressionTensor:
@@ -367,15 +176,10 @@ class ProcessGraph:
         self.expand_complex = expand_complex
         self.domain_shape = ()
         self.roots = []
-        self.role_schemas = {
-            'IndexedBase': {'up':{'base':1}, 'down':{}},
-            'Indexed': {'up':{'base':1, 'index':'many'},'down':{}},
-            'Idx': {'up':{'limits': 'many'}, 'down':{}},
-            'Sum': {'up':{'body': 1, 'limits': 'many'}, 'down':{}},
-            # etc - you can expand this for functions, FFTs, etc.
-        }
-        self.scheduler = ILPScheduler(self)
+        self.role_schemas = role_schemas
         
+        self.scheduler = ILPScheduler(self)
+        self.consumer_queues = {}
 
     def full_recombinatorics(self, expr, level=1):
         """
@@ -542,22 +346,25 @@ class ProcessGraph:
             while current_outputs < min_outputs:
                 store_label = f"Store[{nid}:{current_outputs}]"
                 store_node_id = id(store_label)
+                #print(f"store_node_id: {store_node_id}, store_label: {store_label}, store_id: {store_id}")
+                domain_node = DomainNode(
+                    shape=(1, 1, 1),  # default shape for store nodes
+                    unit_size=1,  # default unit size for store nodes
+                )
+                dom_id = id(domain_node)
+                domain_node.id = dom_id  # ensure domain node has a unique ID
                 self.G.add_node(
                     store_node_id,
                     label=store_label,
                     type="Store",
-                    domain_node=DomainNode(
-                        id=store_node_id,
-                        shape=(1, 1, 1),  # default shape for store nodes
-                        unit_size=1,  # default unit size for store nodes
-                    ),#when you get back fix datasetexclusivity in data graph
-
+                    domain_node=domain_node,
                     store_id=store_id,
                     expr_obj=store_label,
-                    parents=[(nid, 'value')],
+                    parents=[(nid, 'result')],
                     children=[]
                 )
-                node_data['children'].append((store_node_id, 'value'))
+
+                node_data['children'].append((store_node_id, 'result'))
 
                 edge = Edge(
                     id = (nid, store_node_id, 'output', 'result'),
@@ -572,21 +379,20 @@ class ProcessGraph:
     def group_edges_by_dataset(self, dataG):
         """
         Returns a nested dict grouping each edge by the (role, level, type) tuples found in its 'extras'.
-        Structure: { role: { level: { typ: [ (src, tgt), ... ] } } }
+        Structure: { level: { type: { role: [ (src, tgt), ... ] } } }
         """
         grouped = {}
+        if dataG is None or not isinstance(dataG, nx.DiGraph):
+            raise ValueError("dataG must be a valid DiGraph instance")
+        
         for src, tgt, attrs in dataG.edges(data=True):
             for ds in attrs.get('extras', []):
-                role, level, typ = ds
-                # initialize nested dicts if needed
-                if level not in grouped:
-                    grouped[level] = {}
-                if typ not in grouped[level]:
-                    grouped[level][typ] = {}
-                if role not in grouped[level][typ]:
-                    grouped[level][typ][role] = []
-                # append the edge tuple
-                grouped[level][typ][role].append((src, tgt))
+                level, typ, role = ds
+                # Initialize nested dicts if needed
+                grouped.setdefault(level, {}).setdefault(typ, {}).setdefault('input', [])
+                grouped[level][typ].setdefault('intermediate', [])
+                grouped[level][typ].setdefault('output', [])
+                grouped[level][typ].setdefault(role, []).append((src, tgt))
         return grouped
 
     def check_set_involvement(self, node, nodeset):
@@ -594,9 +400,9 @@ class ProcessGraph:
         Check if a node is involved in a nodeset.
         Returns True if the node is part of the nodeset, False otherwise.
         """
-        for (role, lvl, typ), candidate_node in nodeset:
+        for (lvl, typ, role), candidate_node in nodeset:
             if candidate_node == node:
-                return (role, lvl, typ)  # return the role, level, type if involved
+                return (lvl, typ, role)  # return the role, level, type if involved
         return None  # not involved in this nodeset
 
     def create_data_flow_dag(self, nodesets, uG):
@@ -611,10 +417,11 @@ class ProcessGraph:
                     continue
                 dom_node = uG.nodes[proc_nid]['domain_node']
                 datasets[dataset_id].add(dom_node.id)
-
+                #print(f"Adding domain node {dom_node.id} for dataset {dataset_id} from process node {proc_nid}")
                 # add the domain node as a vertex in the new DAG
                 dataG.add_node(
                     dom_node.id,
+                    proc_node=proc_nid,
                     label=uG.nodes[proc_nid]['label'],
                     type=uG.nodes[proc_nid]['type'],
                     original_node=proc_nid,
@@ -648,25 +455,28 @@ class ProcessGraph:
         - method='alap' for latest
         """
         self.finalize_graph_with_outputs()  # ensure min_outputs satisfied
-
         self.levels = self.scheduler.compute_levels(method, order)
+        
+        
         self.proc_interference_graph, self.proc_lifespans = self.compute_asap_maxslack_interference(interference_mode)
         self.produce_proc_and_mem_bins(self.proc_lifespans)
         self.universal_graph_interference_bins = self.merge_proc_and_mem_graphs(self.G, self.mG, self.process_bins, self.memory_bins, self.proc_interference_graph)
         self.nodesets = self.condense_to_nodesets()
         self.dataG = self.create_data_flow_dag(self.nodesets, self.uG)
         #print exauhstive summary of items produced
-        print(f"Levels computed: {len(self.levels)} nodes")
-        print(f"Process interference graph: {len(self.proc_interference_graph.nodes)} nodes, {len(self.proc_interference_graph.edges)} edges")
-        print(f"Memory interference graph: {len(self.mG.nodes)} nodes, {len(self.mG.edges)} edges")
-        print(f"Process bins: {len(self.process_bins)} bins")
-        print(f"Memory bins: {len(self.memory_bins)} bins")
-        print(f"Nodesets: {len(self.nodesets)} sets")
-        print(f"Recombinatorics level: {self.recombinatorics_level}")
-        print(f"Domain shape: {self.domain_shape}")
-        print(f"Universal graph: {len(self.uG.nodes)} nodes, {len(self.uG.edges)} edges")
-        print(f"Universal interference bins: {len(self.uGI.nodes)} nodes, {len(self.uGI.edges)} edges")
-        print(f"Universal interference graph: {len(self.uGI.nodes)} nodes, {len(self.uGI.edges)} edges")
+        verbose = False
+        if verbose:
+            print(f"Levels computed: {len(self.levels)} nodes")
+            print(f"Process interference graph: {len(self.proc_interference_graph.nodes)} nodes, {len(self.proc_interference_graph.edges)} edges")
+            print(f"Memory interference graph: {len(self.mG.nodes)} nodes, {len(self.mG.edges)} edges")
+            print(f"Process bins: {len(self.process_bins)} bins")
+            print(f"Memory bins: {len(self.memory_bins)} bins")
+            print(f"Nodesets: {len(self.nodesets)} sets")
+            print(f"Recombinatorics level: {self.recombinatorics_level}")
+            print(f"Domain shape: {self.domain_shape}")
+            print(f"Universal graph: {len(self.uG.nodes)} nodes, {len(self.uG.edges)} edges")
+            print(f"Universal interference bins: {len(self.uGI.nodes)} nodes, {len(self.uGI.edges)} edges")
+            print(f"Universal interference graph: {len(self.uGI.nodes)} nodes, {len(self.uGI.edges)} edges")
 
     def extract_full_process_graph(self):
         nodes = {}
@@ -688,7 +498,7 @@ class ProcessGraph:
     def build_from_expression(self, expr_or_tensor, *domain_dims):
         if isinstance(expr_or_tensor, tuple) and isinstance(expr_or_tensor[1], ExpressionTensor):
             registry, et = expr_or_tensor
-            print(registry)
+            #print(registry)
             
             self.domain_shape = et.domain_shape
             self.roots = []
@@ -883,50 +693,205 @@ class ProcessGraph:
         return ExpressionTensor(data=tensor_data, domain_shape=self.domain_shape)
 
     def consumer_at(self, src):
-        return self.consumer_queues[src] if src in self.consumer_queues else None
-    
-    def run_process_node(self, src, data):
-        producer = self.G.nodes[src].get('expr_obj', None)
-        if producer is None:
-            raise ValueError(f"No producer function found for node {src}")
-        if isinstance(data, ExpressionTensor):
-            data = data.to_numpy()
-        return producer(data)
-
-
-    def run_at(self, level, type, role):
         """
-        Run the graph at a specific level, type, and role.
-        Returns a list of results for that level/type/role.
+        Return the real consumer queue if it exists.
+        Otherwise, **soft-fail** by returning the dummy queue that
+        always yields random floats, so upstream logic keeps running.
         """
-        results = []
-        # 2) get nested grouping: { level → { type → { role → [ (src, tgt), … ] } } }
-        grouped = self.group_edges_by_dataset(self.dataG)
+        q = self.consumer_queues.get(src)   # whatever container you use
+        if q is not None:
+            return q
+        # soft-fail: keep the pipeline alive
+        return _DUMMY_QUEUE
+        
+    ###############################################################################
+    #  Improved single-step executor
+    ###############################################################################
+    def run_process_node(self, proc_id: int, incoming_value=None):
+        """
+        Execute a single *process* node (identified by ``proc_id``) once all of its
+        mandatory inputs have arrived.
 
-        # 3) flatten that grouping into an ordered sequence (level→type→role)
+        Parameters
+        ----------
+        proc_id : int
+            The node-id used in ``self.G`` for the process node we are about to run.
+        incoming_value : Any, optional
+            Fresh data that has just landed in one of this node’s DomainNode
+            buffers.  We **cache** it but do *not* rely on the caller to tell us
+            which role it belongs to – that information is on the edge metadata.
+
+        Returns
+        -------
+        result : Any
+            • The computed value for ``proc_id`` **once the node is ready**.  
+            • *None* if the node is still waiting on other inputs.
+        """
+
+        # ------------------------------------------------------------------ setup
+        if not hasattr(self, "_value_cache"):
+            self._value_cache: dict[int, Any] = {}        # finalised results
+        if not hasattr(self, "_pending_inputs"):
+            # role-map under construction for each node:  role -> [values …]
+            self._pending_inputs: dict[int, dict[str, list]] = {}
+
+        if proc_id in self._value_cache:          # already evaluated
+            return self._value_cache[proc_id]
+
+        node_meta   = self.G.nodes[proc_id]
+        parents     = node_meta.get("parents", [])
+        node_type   = node_meta["type"]
+
+        # ----------------------------------------------------------------- stash the *incoming* value (if any)
+        #   We know *which* parent delivered it by consulting the process-graph
+        #   edges looking at producer_role / consumer_role pairs stored in Edge.extra.
+        if incoming_value is not None:
+            for p_id, _ in parents:
+                if not self.G.has_edge(p_id, proc_id):
+                    continue
+                for e in self.G[p_id][proc_id].get("extra", []):
+                    if getattr(e, "target", None) == proc_id:
+                        role = e.id[3]                     # consumer_role
+                        self._pending_inputs \
+                            .setdefault(proc_id, {}) \
+                            .setdefault(role,   []) \
+                            .append(incoming_value)
+                        break
+
+        # --------------------------------------------------------- are we “ready”?
+        sig          = operator_signatures.get(node_type, operator_signatures["Default"])
+        min_inputs   = sig.get("min_inputs", 0)
+        pending_roles= self._pending_inputs.get(proc_id, {})
+        have_inputs  = sum(len(v) for v in pending_roles.values())
+
+        # If the operator needs more data, just return – we will be called again
+        if have_inputs < min_inputs:
+            return None
+
+        # ------------------------------------------------------------- build role_map
+        role_map: dict[str, list] = pending_roles.copy()
+        role_map = {role: [_resolve(v) for v in vals]
+                    for role, vals in role_map.items()}
+        # Fill literals / zero-parent nodes on demand
+        if not parents and not role_map:
+            # constants, symbols, etc.
+            lit = node_meta.get("expr_obj")
+            if isinstance(lit, (int, float, complex, sympy.Basic)):
+                role_map.setdefault("value", []).append(lit)
+
+        # ------------------------------------------------------------- dispatch
+        op_dispatch   = {**default_funcs}        # you can merge user overrides here
+        handler = op_dispatch.get(node_type)
+
+        # ----------  ✨ stop-gap for bare symbols / unknown nodes  ----------
+        if handler is None:
+            # treat the node as a literal SymPy object and just return it
+            lit = node_meta.get("expr_obj")
+            if isinstance(lit, sympy.Basic):
+                self._value_cache[proc_id] = lit        # memoise
+                return lit                              # hand it downstream
+            # fall back to original failure for truly unsupported types
+            raise TypeError(
+                f"No handler registered for node-type '{node_type}' "
+                f"with id {proc_id} (parents: {parents})"
+            )
+        # -------------------------------------------------------------------
+
+
+        # Convert ExpressionTensor → ndarray so user handlers don’t have to care
+        for k, lst in role_map.items():
+            for i, item in enumerate(lst):
+                if isinstance(item, ExpressionTensor):
+                    lst[i] = item.to_numpy()
+
+        try:
+            result = handler(role_map)
+        except Exception as err:
+            raise RuntimeError(f"While executing node {proc_id} ({node_type}): {err}") from err
+
+        # -------------------------------------------------------- commit + cleanup
+        self._value_cache[proc_id]  = result
+        self._pending_inputs.pop(proc_id, None)           # free memory
+
+        # Also make the result available to this node’s DomainNode so that
+        # downstream consumers can `get()` it without recomputing.
+        if proc_id in self.dataG.nodes:
+            dn = self.dataG.nodes[proc_id]["domain_node"]
+            dn.put(("value", result))                      # simple convention
+
+        return result
+
+
+    def sort_roles(self, grouped):
+        """
+        Sort roles in the order: input, intermediate, output, followed by any remaining roles.
+        """
+        basics = ['input', 'intermediate', 'output']
         ordered_keys = []
         for lvl in sorted(grouped):
             for typ in sorted(grouped[lvl]):
-                for role in sorted(grouped[lvl][typ]):
-                    ordered_keys.append((role, lvl, typ))
-        total = len(ordered_keys)
-        for idx, (role, lvl, typ) in enumerate(ordered_keys):
+                roles_present = list(grouped[lvl][typ].keys())
+                for role in basics:
+                    if role in grouped[lvl][typ]:
+                        ordered_keys.append((lvl, typ, role))
+                for role in sorted(roles_present):
+                    if role not in basics:
+                        ordered_keys.append((lvl, typ, role))
+        return ordered_keys
+
+
+    # ------------------------------------------------------------------ helpers
+    def _ensure_domain(self, nid):
+        """Return a DomainNode for nid, creating one if necessary."""
+        dn = self.dataG.nodes[nid].get('domain_node')
+        if dn is None:
+            dn       = DomainNode(shape=(1, 1, 1), unit_size=1)
+            dn.id    = id(dn)
+            self.dataG.nodes[nid]['domain_node'] = dn
+        return dn
+
+
+    # ---------------------------------------------------------------- run_at
+    def run_at(self, level=None, type=None, role_=None):
+        """
+        Execute the data-flow slice identified by (level, type, role_).
+        Returns list of results produced at that slice.
+        """
+        results  = []
+        grouped  = self.group_edges_by_dataset(self.dataG)
+        for lvl, typ, role in self.sort_roles(grouped):
+
+            # fast-path filters -------------------------------------------------
+            if level is not None and lvl != level:      continue
+            if type  is not None and typ != type:       continue
+            if role_ is not None and role != role_:     continue
+
+            edges = grouped[lvl][typ][role]
+
             if role == "input":
-                for src, tgt in grouped[lvl][typ][role]:
-                    self.dataG.nodes[src].get('domain_node').put((tgt, self.consumer_at(src)))
+                for src, tgt in edges:
+                    self._ensure_domain(src).put(tgt, self.consumer_at(src))
+
             elif role == "intermediate":
-                for src, tgt in grouped[lvl][typ][role]:
-                    is_writing = tgt in self.mG.nodes
-                    if is_writing:
-                        next_tgts = self.dataG.edges[src, tgt].get('extras', [])
-                        if next_tgts:
-                            for next_tgt in next_tgts:
-                                new_data = self.run_process_node(src, self.dataG.nodes[src].get('domain_node').get(tgt))
-                                self.dataG.nodes[tgt].get('domain_node').put((next_tgt, new_data))
-                    else:
-                        self.dataG.nodes[tgt].get('domain_node').put(self.dataG.nodes[src].get('domain_node').get(tgt))
+                for src, tgt in edges:
+                    src_dn = self._ensure_domain(src)
+                    tgt_dn = self._ensure_domain(tgt)
+
+                    if tgt in self.mG.nodes:            # writing to memory node
+                        for next_tgt in self.dataG.edges[src, tgt].get('extras', []):
+                            val = src_dn.get(tgt)
+                            new_val = self.run_process_node(
+                                self.dataG.nodes[src].get('proc_node'), val)
+                            tgt_dn.put(next_tgt, new_val)
+                    else:                               # plain forward
+                        tgt_dn.put(tgt, src_dn.get(tgt))
+
             elif role == "output":
-                return self.dataG.nodes[src].get('domain_node').get()
+                print("Running output role...")
+                for src, _ in edges:
+                    results.extend(self._ensure_domain(src).get_all())
+                    print(f"Output from {src}: {results}")
+
         return results
 
     def merge_proc_and_mem_graphs(self, proc_graph, mem_graph, proc_bins, mem_bins, proc_interference_graph):
@@ -942,7 +907,7 @@ class ProcessGraph:
         self.uGI.add_edges_from(proc_interference_graph.edges(data=False))
 
         universal_graph_interference_bins = []
-
+        #print(mem_bins, proc_bins)
         for idx, (stage1, stage2) in enumerate(zip(mem_bins, proc_bins)):
             while len(universal_graph_interference_bins) <= idx:
                 universal_graph_interference_bins.append([])
@@ -951,8 +916,9 @@ class ProcessGraph:
                 if node in mem_graph:
                     for src, dst, data in proc_graph.edges(data=True):
                         for extra_item in data.get('extra', []):
+                            #print(f"Processing edge {src} -> {dst} with extra item {extra_item}")
                             # our memory node ids come from the Edge subedge that defined them
-                            if id(extra_item) == node and (src in stage2 or dst in stage2):
+                            if id(extra_item) == mem_graph.nodes[node].get('edge_id') and (src in stage2 or dst in stage2):
                                 self.uG.add_edge(src, node, label=f"{self.G.nodes[src]['label']} -> {self.mG.nodes[node]['label']}")
                                 self.uG.add_edge(node, dst, label=f"{self.mG.nodes[node]['label']} -> {self.G.nodes[dst]['label']}")
                                 if not universal_graph_interference_bins[idx]:
@@ -1112,19 +1078,20 @@ class ProcessGraph:
                                                     print(f"Symbolic engine object for source node: {symbolic_engine_object}")
                                                 shape = symbolic_engine_object.shape if hasattr(symbolic_engine_object, 'shape') else (1,)
                                     
-
                                     domain_node = DomainNode(
-                                        id=id(edge),
-                                        shape=shape
+                                        shape if isinstance(shape, (list, tuple)) else (shape,),
+                                    
                                     )
+                                    domain_node.id = id(domain_node)
                                     self.mG.add_node(
-                                        domain_node.id,
+                                        id(domain_node),
+                                        edge_id=id(edge),
                                         label=f"Memory for: {source_node['label']} -> {target_node['label']}",
                                         domain_node=domain_node,
                                         type='Memory',
                                         store_id=source_node.get('store_id', None),
                                     )
-                                    memory_bins[idx].append(domain_node.id)
+                                    memory_bins[idx].append(id(domain_node))
                                     # we don't extend the domain node over an additional idx
                                     # because it's tracking the process nodes that already
                                     # extend their lifespan over the same idx
@@ -1148,20 +1115,27 @@ class ProcessGraph:
         return interference_graph, lifespans
 
     def lateral_graph_merge(self, graphs_meta):
-        offset = max(self.G.nodes)+1 if self.G.nodes else 0
-        for G_loc, lv_loc, nm_loc in graphs_meta:
-            id_map = {old:offset+i for i,old in enumerate(G_loc.nodes)}
-            for old,new in id_map.items():
-                d=G_loc.nodes[old]
-                self.G.add_node(new, **{k:d[k] for k in ['label','type','expr_obj']}, parents=set(), children=set())
-                self.node_map[new]=nm_loc[old]
-                self.levels[new]=lv_loc[old]
-            for u,v in G_loc.edges:
-                uu, vv = id_map[u], id_map[v]
-                self.G.add_edge(uu,vv)
-                self.G.nodes[uu]['children'].add(vv)
-                self.G.nodes[vv]['parents'].add(uu)
-            offset+=len(G_loc.nodes)
+        for G_loc, lvl_loc, nm_loc in graphs_meta:
+            for n in G_loc.nodes:
+                if n in self.G:            # duplicate only if you reused the same expr object
+                    continue               # (rare with id(obj) – safe to ignore)
+                meta = G_loc.nodes[n]
+                self.G.add_node(
+                    n,
+                    label    = meta.get('label', ''),
+                    type     = meta.get('type',  ''),
+                    expr_obj = meta.get('expr_obj'),
+                    parents  = set(),
+                    children = set(),
+                )
+                self.node_map[n] = nm_loc.get(n)
+                self.levels[n]   = lvl_loc.get(n, 0)
+
+            for u, v in G_loc.edges:
+                if not self.G.has_edge(u, v):
+                    self.G.add_edge(u, v)
+                    self.G.nodes[u]['children'].add(v)
+                    self.G.nodes[v]['parents'].add(u)
 
     def group_by_level_and_type(self):
         grouping={}
@@ -1206,6 +1180,9 @@ class ProcessGraph:
         for nid, data in nodes.items():
             lvl = id2lvl[nid]
             sig = operator_signatures.get(data['type'], operator_signatures['Default'])
+            if sig == "Store":
+                print("parse requirements operatore signature scan, found a Store, confirmed presence")
+                exit()
             op = Operation(
                 id=nid,
                 inputs=data['parents'],
@@ -1222,22 +1199,17 @@ class ProcessGraph:
             for parent_id, _ in data['parents']:
                 grandparents = nodes[parent_id]['parents']
                 if grandparents:
-                    intermediate_nodes.setdefault(lvl, {}).setdefault(data['type'], {}).setdefault(nid, set()).add(parent_id)
+                    intermediate_nodes.setdefault(lvl, {}).setdefault(data['type'], []).append(parent_id)
                 else:
-                    input_nodes.setdefault(lvl, {}).setdefault(data['type'], {}).setdefault(nid, set()).add(parent_id)
+                    input_nodes.setdefault(lvl, {}).setdefault(data['type'], []).append(parent_id)
             # classify outputs vs intermediates by examining grandchildren
             for child_id, _ in data['children']:
                 grandchildren = nodes[child_id]['children']
                 if grandchildren:
-                    intermediate_nodes.setdefault(lvl, {}).setdefault(data['type'], {}).setdefault(nid, set()).add(child_id)
+                    intermediate_nodes.setdefault(lvl, {}).setdefault(data['type'], []).append(child_id)
                 else:
-                    output_nodes.setdefault(lvl, {}).setdefault(data['type'], {}).setdefault(nid, set()).add(child_id)
-        # convert all sets to lists
-        for grouping in (input_nodes, intermediate_nodes, output_nodes):
-            for lvl, type_dict in grouping.items():
-                for typ, nid_dict in type_dict.items():
-                    for op_id in list(nid_dict):
-                        nid_dict[op_id] = list(nid_dict[op_id])
+                    output_nodes.setdefault(lvl, {}).setdefault(data['type'], []).append(child_id)
+
         return input_nodes, intermediate_nodes, output_nodes, operations
     
     def condense_to_nodesets(self, proc_graph=None):
@@ -1269,7 +1241,7 @@ class ProcessGraph:
                                             location_in_memory=self.uG.nodes[nid].get('domain_node', None),
                                             readwrite=READWRITE)
                                        for i, nid in enumerate(ids)]
-                    nodesets[(role, lvl, typ)] = ns
+                    nodesets[(lvl, typ, role)] = ns
 
         create_nodesets(inputs, "input")
         create_nodesets(intermediates, "intermediate")
@@ -1285,185 +1257,26 @@ class ProcessGraph:
             bands.setdefault(lvl,{}).setdefault(tp,[]).append(lbl)
         return bands
 
-    def print_parallel_bands(self):
-        """
-        Colorized print of parallel execution bands.
-        """
-        bands = self.serialize_bands()
-        num_levels = len(bands)
-        print("\n=== Parallel execution bands ===")
-        for lvl in sorted(bands):
-            color = get_color(lvl, num_levels)
-            print(f"{color}Level {lvl}:{Style.RESET_ALL}")
-            for tp, labels in bands[lvl].items():
-                print(f"{color}  {tp}:{Style.RESET_ALL}")
-                for lbl in labels:
-                    print(f"{color}    - {lbl}{Style.RESET_ALL}")
-
-    def print_colorized_operations(self):
-        """
-        Colorized print of operations sorted by dependencies.
-        """
-        proc = self.extract_full_process_graph()
-        _, _, _, ops = self.parse_requirements(proc)
-        print("\n=== Operations ===")
-        # normalize hues to sequence levels count
-        seqs = [op.sequence_order for op in ops.values()]
-        num_levels = max(seqs) + 1 if seqs else 1
-        for op in Operation.default_sort(ops.values()):
-            lvl = op.sequence_order
-            color = get_color(lvl, num_levels)
-            print(f"{color}{op}{Style.RESET_ALL}")
-
-    def print_colorized_expressions(self):
-        """
-        Inline serial colorization: show each node's full symbolic expression with component levels colored.
-        """
-        proc = self.extract_full_process_graph()
-        nodes_meta = proc['nodes']
-        num_levels = len(proc['levels'])  # for hue normalization
-        print("\n=== Dependency fabric with color-coded parent inclusions ===")
-        for nid, data in nodes_meta.items():
-            text = data['label']
-            for pid, _ in data['parents']:
-                parent_label = nodes_meta[pid]['label']
-                parent_level = nodes_meta[pid]['level']
-                color = get_color(parent_level, num_levels)
-                if parent_label in text:
-                    import re
-                    pattern = re.compile(re.escape(parent_label))
-                    text = pattern.sub(f"{color}[{parent_label}]{Style.RESET_ALL}", text, count=1)
 
 
-            print(f"Expr: {text}")
-
-    def print_bands_and_ops(self):
-        # Colorized parallel bands, expressions, and operations
-        self.print_parallel_bands()
-        self.print_colorized_expressions()
-        self.print_colorized_operations()
-
-
-    def plot_simple_graph(self, graph, layout='spring'):
+    def setup_consumer_queues(self, src, random_data=False):
         """
-        Plots a simple flowchart-like view of the graph without edge labels.
+        Set up the consumer queue for a given source node.
+        If random_data is True, use a generator to supply random float data to the queue.
         """
-        plt.figure(figsize=(12, 8))
-        if layout == 'spring':
-            pos = nx.spring_layout(graph, seed=42)
-        elif layout == 'shell':
-            pos = nx.shell_layout(graph)
+        if src not in self.consumer_queues:
+            self.consumer_queues[src] = deque()
+
+        def random_float_generator():
+            while True:
+                yield random.uniform(0.0, 1.0)
+
+        if random_data:
+            generator = random_float_generator()
+            for _ in range(10):  # Populate the queue with 10 initial values
+                self.consumer_queues[src].append(next(generator))
         else:
-            pos = nx.spring_layout(graph, seed=42)
-        labels = nx.get_node_attributes(graph, 'label')
-        nx.draw(graph, pos, with_labels=True, labels=labels, node_size=800,
-                node_color='lightblue', edge_color='gray', font_size=10)
-        plt.show()
-
-    def plot_graph_with_roles(self, layout='spring'):
-        """
-        Plots the graph with edge labels showing producer->consumer roles from Edge.extra.
-        """
-        plt.figure(figsize=(12, 8))
-        if layout == 'spring':
-            pos = nx.spring_layout(self.G, seed=42)
-        elif layout == 'shell':
-            pos = nx.shell_layout(self.G)
-        else:
-            pos = nx.spring_layout(self.G, seed=42)
-        
-        nx.draw(self.G, pos, with_labels=True, node_size=800, node_color='lightblue',
-                edge_color='gray', font_size=10)
-        
-        # Extract edge roles
-        edge_labels = {}
-        for u, v, data in self.G.edges(data=True):
-            # Build label from your Edge extras
-            extras = data.get('extra', [])
-            label_parts = []
-            for e in extras:
-                if hasattr(e, 'id') and len(e.id) >= 4:
-                    label_parts.append(f"{e.id[2]}→{e.id[3]}")
-            edge_labels[(u, v)] = ", ".join(label_parts)
-        
-        nx.draw_networkx_edge_labels(self.G, pos, edge_labels=edge_labels, font_size=8)
-        plt.show()
-
-
-    def get_rgb_color(level, num_levels):
-        """Convert a level to an RGB tuple."""
-        hue = (level % num_levels) / num_levels
-        r, g, b = colorsys.hsv_to_rgb(hue, 1, 1)
-        return (r, g, b)
-
-    def animate_data_flow(self, dataG, duration=5, fps=30):
-        """
-        Animate the data flow graph by cycling through datasets present in edge 'extras'.
-        Colors nodes and edges belonging to the current dataset.
-        """
-        # 1) layout
-        pos = nx.shell_layout(dataG)
-
-        # 2) get nested grouping: { level → { type → { role → [ (src, tgt), … ] } } }
-        grouped = self.group_edges_by_dataset(dataG)
-
-        # 3) flatten that grouping into an ordered sequence (level→type→role)
-        ordered_keys = []
-        for lvl in sorted(grouped):
-            for typ in sorted(grouped[lvl]):
-                for role in sorted(grouped[lvl][typ]):
-                    ordered_keys.append((role, lvl, typ))
-        total = len(ordered_keys)
-
-        # 4) draw static background
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.set_title("Data Flow Animation")
-        ax.axis('off')
-        nx.draw_networkx_edges(dataG, pos, ax=ax, edge_color='lightgray')
-        node_collection = nx.draw_networkx_nodes(dataG, pos, ax=ax, node_color='lightgray')
-        nx.draw_networkx_labels(dataG, pos, ax=ax, font_size=8)
-
-        # 5) keep handles to each edge line + its extras
-        edge_lines = {}
-        for (u, v, attrs) in dataG.edges(data=True):
-            line = ax.plot(
-                [pos[u][0], pos[v][0]],
-                [pos[u][1], pos[v][1]],
-                color='lightgray',
-                linewidth=2
-            )[0]
-            edge_lines[(u, v)] = (line, attrs.get('extras', []))
-
-        # 6) animation update uses only ordered_keys
-        def update(frame):
-            current = ordered_keys[frame % total]
-            ax.set_title(f"Dataset: {current}")
-
-            # highlight edges in this dataset
-            for (u, v), (line, extras) in edge_lines.items():
-                if current in extras:
-                    line.set_color('red')
-                    line.set_linewidth(3)
-                else:
-                    line.set_color('lightgray')
-                    line.set_linewidth(1)
-
-            # highlight connected nodes
-            highlights = {
-                u for (u, v), (_, extras) in edge_lines.items() if current in extras
-            } | {
-                v for (u, v), (_, extras) in edge_lines.items() if current in extras
-            }
-            node_colors = [
-                'blue' if n in highlights else 'lightgray'
-                for n in dataG.nodes()
-            ]
-            node_collection.set_color(node_colors)
-            return list(edge_lines.keys()) + [node_collection]
-
-        frames = total * fps
-        anim = FuncAnimation(fig, update, frames=frames, interval=1000/fps, blit=False, repeat=True)
-        plt.show()
+            self.consumer_queues[src].append(None)  # Default behavior
 
 # Example usage:
 # animate_data_flow(pg.dataG)
@@ -1534,9 +1347,10 @@ def main():
         # run the original data correctness
         pg.compute_levels(method='alap')  # use ASAP for correct run to match tests
         #pg.print_lifespans_ascii()
+        
         data_sources = test['data_sources']()
-        pg.animate_data_flow(pg.dataG, duration=5, fps=2)
-        #pg.plot_simple_graph(pg.dataG, layout='shell')
+        #pg.animate_data_flow(pg.dataG, duration=5, fps=2)
+        pg.plot_simple_graph(pg.dataG, layout='shell')
         #print(run(pg, data_sources, test['expected_fn']))
 
 
